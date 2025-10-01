@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Final Option Chain poller with:
+Option Chain poller — updated with robust batching and 429 handling.
 - instruments master download & cache
 - resolve option contracts for underlying + expiry
 - select ATM +/- STRIKE_WINDOW strikes (default 10)
-- batch market-quote requests with retry/backoff/throttle
+- batch market-quote requests with Retry-After + exponential backoff
 - build compact CE/PE summary and send to Telegram
 """
 import os, time, logging, requests, json, gzip, io, html, datetime
@@ -22,7 +22,7 @@ OPTION_SYMBOL_TCS = os.getenv('OPTION_SYMBOL_TCS') or "NSE_EQ|INE467B01029"
 OPTION_EXPIRY_TCS = os.getenv('OPTION_EXPIRY_TCS') or "2025-10-28"
 
 POLL_INTERVAL = int(os.getenv('POLL_INTERVAL') or 60)
-STRIKE_WINDOW = int(os.getenv('STRIKE_WINDOW') or 10)  # default: 10 strikes each side
+STRIKE_WINDOW = int(os.getenv('STRIKE_WINDOW') or 10)  # start with 10 as you wanted
 INSTRUMENTS_TTL_SECONDS = int(os.getenv('INSTRUMENTS_TTL_SECONDS') or 24*3600)
 
 UPSTOX_INSTRUMENTS_JSON_URL = os.getenv('UPSTOX_INSTRUMENTS_JSON_URL') or "https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz"
@@ -122,7 +122,8 @@ def fetch_and_cache_instruments(force_refresh=False):
 
 def ms_to_ymd(ms):
     try:
-        return datetime.datetime.utcfromtimestamp(ms/1000.0).strftime("%Y-%m-%d")
+        # keep simple UTC conversion (avoid deprecated warnings for now)
+        return datetime.datetime.fromtimestamp(ms/1000.0, datetime.timezone.utc).strftime("%Y-%m-%d")
     except Exception:
         return None
 
@@ -165,24 +166,35 @@ def chunk_list(lst, n):
     for i in range(0, len(lst), n):
         yield lst[i:i+n]
 
-# ------------- Market quote: batched, retry, throttle -------------
+# ------------- Robust market-quote fetch (429-aware) -------------
 def fetch_quotes_for_instrument_keys(instrument_keys):
     out = {}
     if not instrument_keys:
         return out
+
+    # Tune these values as needed
     batch_size = 100
-    retry_delay = 1.0
-    max_retries = 2
+    max_retries = 4
+    base_delay = 1.0  # seconds
+
     for batch in chunk_list(instrument_keys, batch_size):
         params = "&".join(f"instrument_key={quote_plus(str(k))}" for k in batch)
         url = UPSTOX_MARKET_QUOTE_URL + "?" + params
-        success = False
-        tries = 0
-        while not success and tries <= max_retries:
-            tries += 1
+        attempt = 0
+        while attempt <= max_retries:
+            attempt += 1
             try:
-                logging.info("Market-quote fetch URL (batch size %d): %.200s", len(batch), url)
-                r = requests.get(url, headers=HEADERS, timeout=25)
+                logging.info("Market-quote fetch (batch size %d) attempt %d: %.200s", len(batch), attempt, url)
+                r = requests.get(url, headers=HEADERS, timeout=30)
+                if r.status_code == 429:
+                    ra = r.headers.get("Retry-After")
+                    try:
+                        wait = float(ra) if ra is not None else (base_delay * (2 ** (attempt-1)))
+                    except:
+                        wait = base_delay * (2 ** (attempt-1))
+                    logging.warning("Received 429. Waiting %.1fs before retry (Retry-After=%s).", wait, ra)
+                    time.sleep(wait)
+                    continue
                 r.raise_for_status()
                 j = r.json()
                 data = j.get("data") if isinstance(j, dict) and "data" in j else j
@@ -195,11 +207,15 @@ def fetch_quotes_for_instrument_keys(instrument_keys):
                     key = data.get("instrument_key") or data.get("instrumentKey")
                     if key:
                         out[key] = data
-                success = True
-            except Exception as e:
-                logging.warning("Market-quote batch fetch failed (attempt %d): %s", tries, e)
-                time.sleep(retry_delay * tries)
-        time.sleep(0.08)
+                # polite pause after success
+                time.sleep(0.12)
+                break
+            except requests.exceptions.RequestException as e:
+                wait = base_delay * (2 ** (attempt-1))
+                logging.warning("Market-quote batch fetch failed (attempt %d): %s. Backing off %.1fs", attempt, e, wait)
+                time.sleep(wait)
+        else:
+            logging.error("Batch failed after %d attempts; skipping these keys.", max_retries)
     return out
 
 # ------------- Build option chain from rows + quotes -------------
@@ -211,7 +227,6 @@ def build_option_chain_from_instruments(instrument_rows, quotes_map):
         strike = row.get("strike_price") or row.get("strike") or row.get("strikePrice")
         try:
             if strike is None:
-                # try parsing last numeric in symbol
                 parts = str(ts).split()
                 found = None
                 for p in parts:
@@ -276,7 +291,41 @@ def build_summary_text_from_strikes(label, strikes_list, atm_strike=None, window
         lines.append(f"<code>{str(int(float(strike))).rjust(6)}{atm_mark}   {ce.ljust(20)} | {pe}</code>")
     return "\n".join(lines)
 
-# ------------- Orchestration (optimized selection + batched fetch) -------------
+# ------------- Orchestration (with underlying batching & refinement) -------------
+def select_window_keys(option_rows, atm_val, window=STRIKE_WINDOW):
+    strike_map = {}
+    for r in option_rows:
+        try:
+            strike = float(r.get("strike_price") or r.get("strike") or 0)
+        except:
+            continue
+        ik = r.get("instrument_key") or r.get("instrumentToken") or r.get("instrument_token")
+        ts = str(r.get("tradingsymbol") or r.get("trading_symbol") or r.get("symbol") or "")
+        side = "ce" if (" ce" in ts.lower() or ts.lower().endswith("ce") or "call" in ts.lower()) else ("pe" if (" pe" in ts.lower() or ts.lower().endswith("pe") or "put" in ts.lower()) else None)
+        if strike not in strike_map:
+            strike_map[strike] = {"strike": strike, "ce": None, "pe": None}
+        if side == "ce":
+            strike_map[strike]["ce"] = ik
+        elif side == "pe":
+            strike_map[strike]["pe"] = ik
+    strikes_sorted = sorted(strike_map.keys())
+    if not strikes_sorted:
+        return []
+    if atm_val is None:
+        center_idx = len(strikes_sorted)//2
+    else:
+        center_idx = min(range(len(strikes_sorted)), key=lambda i: abs(strikes_sorted[i]-atm_val))
+    start = max(0, center_idx - window)
+    end = min(len(strikes_sorted)-1, center_idx + window)
+    chosen = []
+    for s in strikes_sorted[start:end+1]:
+        rec = strike_map[s]
+        if rec.get("ce"):
+            chosen.append(rec["ce"])
+        if rec.get("pe"):
+            chosen.append(rec["pe"])
+    return chosen
+
 def poll_once_and_send():
     instruments = fetch_and_cache_instruments(force_refresh=False)
     if not instruments:
@@ -287,80 +336,71 @@ def poll_once_and_send():
     tcs_rows   = resolve_option_instruments_for(instruments, "tcs", OPTION_EXPIRY_TCS)
     logging.info("Found option rows: Nifty=%d, TCS=%d", len(nifty_rows), len(tcs_rows))
 
-    # estimate ATM using underlying LTP if possible, else median strike
-    def estimate_atm(option_rows, instruments, underlying_term):
-        # attempt to find underlying instrument in instruments list and fetch its quote
-        underlying_ltp = None
+    # find underlying instrument_key(s) once
+    def find_underlying_key(instruments, term):
+        term = term.lower()
+        for r in instruments:
+            ks = (r.get("instrument_key") or r.get("instrumentKey") or "")
+            ts = str(r.get("tradingsymbol") or r.get("symbol") or "").lower()
+            name = str(r.get("name") or "").lower()
+            if term in ks.lower() or term in ts or term in name:
+                return ks
+        return None
+
+    nifty_under_key = find_underlying_key(instruments, "nifty")
+    tcs_under_key   = find_underlying_key(instruments, "tcs")
+
+    # initial selection using median (ATM unknown) — small set
+    nifty_keys_initial = select_window_keys(nifty_rows, None)
+    tcs_keys_initial   = select_window_keys(tcs_rows, None)
+
+    # include underlying keys to fetch actual LTP for ATM estimation
+    all_keys = []
+    if nifty_under_key:
+        all_keys.append(nifty_under_key)
+    if tcs_under_key and tcs_under_key != nifty_under_key:
+        all_keys.append(tcs_under_key)
+    all_keys.extend(k for k in (nifty_keys_initial + tcs_keys_initial) if k)
+
+    # dedupe preserving order
+    seen = set()
+    all_keys_unique = []
+    for k in all_keys:
+        if k and k not in seen:
+            seen.add(k)
+            all_keys_unique.append(k)
+
+    logging.info("Final keys to fetch (incl underlying): %d", len(all_keys_unique))
+    quotes_map = fetch_quotes_for_instrument_keys(all_keys_unique)
+
+    # compute ATM from underlying quotes if available
+    nifty_atm = None
+    tcs_atm = None
+    if nifty_under_key and quotes_map.get(nifty_under_key):
         try:
-            for r in instruments:
-                ks = (r.get("instrument_key") or r.get("instrumentKey") or "")
-                ts = str(r.get("tradingsymbol") or r.get("symbol") or "").lower()
-                name = str(r.get("name") or "").lower()
-                if underlying_term in ks.lower() or underlying_term in ts or underlying_term in name:
-                    q = fetch_quotes_for_instrument_keys([ks])
-                    if q and q.get(ks):
-                        underlying_ltp = q[ks].get("last_traded_price") or q[ks].get("ltp")
-                        break
-        except Exception:
-            underlying_ltp = None
-        if underlying_ltp:
-            try:
-                return float(underlying_ltp)
-            except:
-                pass
-        # fallback median strike
-        try:
-            mid = option_rows[len(option_rows)//2]
-            return float(mid.get("strike_price") or mid.get("strike") or 0)
+            nifty_atm = float(quotes_map[nifty_under_key].get("last_traded_price") or quotes_map[nifty_under_key].get("ltp"))
         except:
-            return None
+            nifty_atm = None
+    if tcs_under_key and quotes_map.get(tcs_under_key):
+        try:
+            tcs_atm = float(quotes_map[tcs_under_key].get("last_traded_price") or quotes_map[tcs_under_key].get("ltp"))
+        except:
+            tcs_atm = None
 
-    nifty_atm = estimate_atm(nifty_rows, instruments, "nifty")
-    tcs_atm   = estimate_atm(tcs_rows, instruments, "tcs")
-    logging.info("Estimated ATMs: Nifty= %s, TCS= %s", nifty_atm, tcs_atm)
+    logging.info("Estimated ATMs: Nifty=%s, TCS=%s", nifty_atm, tcs_atm)
 
-    # select window keys (ATM +/- STRIKE_WINDOW). returns list of instrument_keys (CE+PE)
-    def select_window_keys(option_rows, atm_val, window=STRIKE_WINDOW):
-        strike_map = {}
-        for r in option_rows:
-            try:
-                strike = float(r.get("strike_price") or r.get("strike") or 0)
-            except:
-                continue
-            ik = r.get("instrument_key") or r.get("instrumentToken") or r.get("instrument_token")
-            ts = str(r.get("tradingsymbol") or r.get("trading_symbol") or r.get("symbol") or "")
-            side = "ce" if (" ce" in ts.lower() or ts.lower().endswith("ce") or "call" in ts.lower()) else ("pe" if (" pe" in ts.lower() or ts.lower().endswith("pe") or "put" in ts.lower()) else None)
-            if strike not in strike_map:
-                strike_map[strike] = {"strike": strike, "ce": None, "pe": None}
-            if side == "ce":
-                strike_map[strike]["ce"] = ik
-            elif side == "pe":
-                strike_map[strike]["pe"] = ik
-        strikes_sorted = sorted(strike_map.keys())
-        if not strikes_sorted:
-            return []
-        if atm_val is None:
-            center_idx = len(strikes_sorted)//2
-        else:
-            center_idx = min(range(len(strikes_sorted)), key=lambda i: abs(strikes_sorted[i]-atm_val))
-        start = max(0, center_idx - window)
-        end = min(len(strikes_sorted)-1, center_idx + window)
-        chosen = []
-        for s in strikes_sorted[start:end+1]:
-            rec = strike_map[s]
-            if rec.get("ce"):
-                chosen.append(rec["ce"])
-            if rec.get("pe"):
-                chosen.append(rec["pe"])
-        return chosen
-
+    # re-select keys around real ATM (if available)
     nifty_keys = select_window_keys(nifty_rows, nifty_atm)
     tcs_keys   = select_window_keys(tcs_rows, tcs_atm)
-    all_keys = list(dict.fromkeys((nifty_keys or []) + (tcs_keys or [])))  # unique maintain order
-    logging.info("Selected keys counts: Nifty=%d, TCS=%d, total=%d", len(nifty_keys), len(tcs_keys), len(all_keys))
 
-    quotes_map = fetch_quotes_for_instrument_keys(all_keys)
+    # fetch any newly selected keys not already fetched
+    refined_new_keys = [k for k in (nifty_keys + tcs_keys) if k and k not in all_keys_unique]
+    if refined_new_keys:
+        logging.info("Fetching additional %d keys for refined ATM window.", len(refined_new_keys))
+        more_quotes = fetch_quotes_for_instrument_keys(refined_new_keys)
+        quotes_map.update(more_quotes)
 
+    # build strikes and send summary
     nifty_strikes = build_option_chain_from_instruments([r for r in nifty_rows if (r.get("instrument_key") in nifty_keys)], quotes_map)
     tcs_strikes   = build_option_chain_from_instruments([r for r in tcs_rows if (r.get("instrument_key") in tcs_keys)], quotes_map)
 
