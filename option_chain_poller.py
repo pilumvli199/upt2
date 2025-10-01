@@ -1,47 +1,60 @@
 #!/usr/bin/env python3
 """
-Option Chain poller for TCS (equity) and Nifty 50 (index).
-- Polls Upstox option/chain endpoint for two configured symbols+expiries
-- Sends a compact summary (ATM +/- STRIKE_WINDOW strikes) to Telegram every POLL_INTERVAL seconds
-- Configure via .env (see .env.example)
+Option Chain poller (single file):
+- Downloads Upstox instrument master (JSON preferred) from assets.upstox.com, caches it.
+- Resolves instrument_key for Nifty / TCS, then fetches option chain using instrument_key + expiry.
+- Sends compact summary to Telegram.
+- Robust fallbacks & verbose logging for UDAPI100060 debugging.
 """
 import os
 import time
 import logging
 import requests
+import gzip
+import json
+import csv
+import io
 import html
 from urllib.parse import quote_plus
 
-# Logging (clean, correct format)
+# ---------- CONFIG / ENV ----------
+UPSTOX_ACCESS_TOKEN = os.getenv('UPSTOX_ACCESS_TOKEN') or ""
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN') or ""
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID') or ""
+
+OPTION_SYMBOL_NIFTY = os.getenv('OPTION_SYMBOL_NIFTY') or "NSE_INDEX|Nifty 50"
+OPTION_EXPIRY_NIFTY = os.getenv('OPTION_EXPIRY_NIFTY') or "2025-10-07"
+
+OPTION_SYMBOL_TCS = os.getenv('OPTION_SYMBOL_TCS') or "NSE_EQ|INE467B01029"
+OPTION_EXPIRY_TCS = os.getenv('OPTION_EXPIRY_TCS') or "2025-10-28"
+
+POLL_INTERVAL = int(os.getenv('POLL_INTERVAL') or 60)
+STRIKE_WINDOW = int(os.getenv('STRIKE_WINDOW') or 5)
+
+# Instruments download/caching
+INSTRUMENTS_CACHE_DIR = os.getenv('INSTRUMENTS_CACHE_DIR') or "./cache"
+INSTRUMENTS_TTL_SECONDS = int(os.getenv('INSTRUMENTS_TTL_SECONDS') or 24*3600)
+
+# Candidate instruments URLs (you can override via env)
+CANDIDATE_INSTRUMENT_URLS = [
+    os.getenv('UPSTOX_INSTRUMENTS_JSON_URL') or "https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz",
+    os.getenv('UPSTOX_INSTRUMENTS_JSON_URL2') or "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz",
+    os.getenv('UPSTOX_INSTRUMENTS_CSV_URL') or "https://assets.upstox.com/instruments/NSE_EQ.csv",
+]
+
+# Option chain URL (default)
+UPSTOX_OPTION_CHAIN_URL = os.getenv('UPSTOX_OPTION_CHAIN_URL') or "https://api.upstox.com/v3/option/chain"
+
+# ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 
-# Config from env
-UPSTOX_ACCESS_TOKEN = os.getenv('UPSTOX_ACCESS_TOKEN')
-TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
-
-# Symbols + expiries (must be provided). Defaults set to your provided expiries.
-OPTION_SYMBOL_NIFTY = os.getenv('OPTION_SYMBOL_NIFTY') or "NSE_INDEX|Nifty 50"
-OPTION_EXPIRY_NIFTY = os.getenv('OPTION_EXPIRY_NIFTY') or "2025-10-07"  # YYYY-MM-DD
-OPTION_SYMBOL_TCS = os.getenv('OPTION_SYMBOL_TCS') or "NSE_EQ|INE467B01029"
-OPTION_EXPIRY_TCS = os.getenv('OPTION_EXPIRY_TCS') or "2025-10-28"    # YYYY-MM-DD
-
-POLL_INTERVAL = int(os.getenv('POLL_INTERVAL') or 60)  # seconds
-STRIKE_WINDOW = int(os.getenv('STRIKE_WINDOW') or 5)   # ATM +/- window
-TOP_N_STRIKES = int(os.getenv('TOP_N_STRIKES') or 10)  # fallback limit to show
-
-UPSTOX_OPTION_CHAIN_URL = os.getenv('UPSTOX_OPTION_CHAIN_URL') or "https://api.upstox.com/v3/option/chain"
-UPSTOX_INSTRUMENTS_URL = os.getenv('UPSTOX_INSTRUMENTS_URL') or ""
-
-# Basic validation
 if not UPSTOX_ACCESS_TOKEN or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
     logging.error("Set UPSTOX_ACCESS_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID in env.")
     raise SystemExit(1)
 
-if not OPTION_EXPIRY_NIFTY or not OPTION_EXPIRY_TCS:
-    logging.warning("OPTION_EXPIRY_NIFTY or OPTION_EXPIRY_TCS not set. You must set expiry dates (YYYY-MM-DD).")
-
 HEADERS = {"Accept": "application/json", "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}"}
+
+os.makedirs(INSTRUMENTS_CACHE_DIR, exist_ok=True)
 
 def send_telegram(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -54,65 +67,163 @@ def send_telegram(text):
         logging.warning("Telegram send failed: %s", e)
         return False
 
-def health_check_token():
-    """Optional lightweight health-check: try a simple GET to the option endpoint (no params) or instruments URL."""
-    logging.info("Performing token health check...")
-    test_url = UPSTOX_INSTRUMENTS_URL or (UPSTOX_OPTION_CHAIN_URL + "?symbol=" + quote_plus(OPTION_SYMBOL_NIFTY))
+# ---------- Instruments fetch / cache / lookup ----------
+def _cache_path():
+    return os.path.join(INSTRUMENTS_CACHE_DIR, "instruments_complete.json")
+
+def _is_cache_fresh(path):
+    if not os.path.exists(path):
+        return False
+    age = time.time() - os.path.getmtime(path)
+    return age < INSTRUMENTS_TTL_SECONDS
+
+def _write_cache_json(path, obj):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f)
+
+def _read_cache_json(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def _try_download_gz_json(url):
+    logging.info("Trying instruments URL: %s", url)
     try:
-        r = requests.get(test_url, headers=HEADERS, timeout=12)
-        logging.info("Health check status: %s", r.status_code)
-        return r.status_code, r.text[:800]
-    except Exception as e:
-        logging.warning("Health check failed: %s", e)
-        return None, str(e)
-
-def fetch_option_chain(symbol, expiry_date):
-    """
-    Fetch option chain. Verbose: logs URL, status, body. If 404 with expiry, tries without expiry as a fallback.
-    Returns parsed JSON or None.
-    """
-    if not symbol:
-        logging.warning("No symbol provided — skipping fetch.")
-        return None
-
-    base = UPSTOX_OPTION_CHAIN_URL
-    params = f"symbol={quote_plus(symbol)}"
-    if expiry_date:
-        params_exp = params + "&expiry_date=" + quote_plus(expiry_date)
-    else:
-        params_exp = params
-
-    url_with_exp = base + "?" + params_exp
-    logging.info("Fetching option chain URL: %s", url_with_exp)
-
-    try:
-        r = requests.get(url_with_exp, headers=HEADERS, timeout=25)
+        r = requests.get(url, timeout=30)
+        r.raise_for_status()
+        content = r.content
+        # If gzipped JSON, gunzip
         try:
-            r.raise_for_status()
-            logging.info("Option chain fetch OK (%s) for %s %s", r.status_code, symbol, expiry_date)
-            return r.json()
-        except requests.exceptions.HTTPError:
-            code = r.status_code
-            body = r.text
-            logging.warning("Option chain fetch HTTPError %s for %s %s: %s", code, symbol, expiry_date, body[:1000])
-            # If 404 and we sent an expiry, try again without expiry to see what's available
-            if code == 404 and expiry_date:
-                logging.info("Received 404 with expiry; trying without expiry to inspect available expiries.")
-                url_no_exp = base + "?" + "symbol=" + quote_plus(symbol)
-                logging.info("Fetching option chain URL (no expiry): %s", url_no_exp)
-                try:
-                    r2 = requests.get(url_no_exp, headers=HEADERS, timeout=25)
-                    r2.raise_for_status()
-                    logging.info("Fallback (no expiry) OK (%s) for %s", r2.status_code, symbol)
-                    return r2.json()
-                except Exception as e2:
-                    body2 = getattr(e2, 'response', None).text if getattr(e2, 'response', None) is not None else str(e2)
-                    logging.warning("Fallback without expiry failed: %s | body: %s", e2, str(body2)[:1000])
-            return None
+            decompressed = gzip.decompress(content).decode('utf-8')
+            # parse JSON
+            js = json.loads(decompressed)
+            logging.info("Downloaded and parsed gz JSON from %s (items=%d)", url, len(js) if isinstance(js, list) else 1)
+            return js
+        except (OSError, gzip.BadGzipFile):
+            # maybe JSON plain
+            try:
+                text = content.decode('utf-8')
+                js = json.loads(text)
+                return js
+            except Exception:
+                pass
+        # If raw CSV
+        try:
+            text = content.decode('utf-8')
+            if "\n" in text and "," in text.splitlines()[0]:
+                rows = list(csv.DictReader(io.StringIO(text)))
+                logging.info("Downloaded CSV instruments with %d rows from %s", len(rows), url)
+                return rows
+        except Exception:
+            pass
     except Exception as e:
-        logging.warning("Option chain fetch failed for %s %s: %s", symbol, expiry_date, e)
+        logging.warning("Failed to download instruments from %s: %s", url, e)
+    return None
+
+def fetch_and_cache_instruments(force_refresh=False):
+    cache_path = _cache_path()
+    if not force_refresh and _is_cache_fresh(cache_path):
+        try:
+            cached = _read_cache_json(cache_path)
+            logging.info("Using cached instruments (%d items)", len(cached) if isinstance(cached, list) else 1)
+            return cached
+        except Exception:
+            logging.warning("Failed to read cached instruments, will re-download.")
+    # try candidate urls
+    last_err = None
+    for url in CANDIDATE_INSTRUMENT_URLS:
+        if not url:
+            continue
+        js = _try_download_gz_json(url)
+        if js:
+            # normalize: if dict with keys, convert to list
+            if isinstance(js, dict):
+                # some JSON files might be object with multiple arrays; try to find list
+                for v in js.values():
+                    if isinstance(v, list):
+                        js = v
+                        break
+            # write cache
+            try:
+                _write_cache_json(cache_path, js)
+                logging.info("Cached instruments to %s", cache_path)
+            except Exception as e:
+                logging.warning("Failed to write cache: %s", e)
+            return js
+    # fallback: try reading existing cache even if stale
+    if os.path.exists(cache_path):
+        try:
+            cached = _read_cache_json(cache_path)
+            logging.warning("Using stale cached instruments (%d items)", len(cached) if isinstance(cached, list) else 1)
+            return cached
+        except Exception as e:
+            last_err = e
+    logging.error("Unable to fetch instruments and no cache available. Last err: %s", last_err)
+    return []
+
+def find_instrument_key(instruments, match_term):
+    """Match by symbol or name. Returns first found instrument_key / instrument_token / token."""
+    if not instruments:
+        return None
+    term = str(match_term).strip().lower()
+    candidate_keys = ("instrument_key","instrumentToken","instrument_token","token","id","instrument_id","instrumentId")
+    symbol_fields = ("tradingsymbol","trading_symbol","symbol","trade_symbol","display_symbol")
+    name_fields = ("name","instrumentName","display_name")
+    for row in instruments:
+        # row may be dict with varied keys
+        row_lower = {}
+        for k,v in row.items():
+            try:
+                row_lower[k] = str(v).lower()
+            except Exception:
+                row_lower[k] = ""
+        # check symbol fields
+        for sf in symbol_fields:
+            if sf in row_lower and term in row_lower[sf]:
+                # get key
+                for k in candidate_keys:
+                    if k in row and row[k]:
+                        return row[k]
+        # check name fields
+        for nf in name_fields:
+            if nf in row_lower and term in row_lower[nf]:
+                for k in candidate_keys:
+                    if k in row and row[k]:
+                        return row[k]
+    # fallback: partial match in any field
+    for row in instruments:
+        for v in row.values():
+            try:
+                if term in str(v).lower():
+                    for k in candidate_keys:
+                        if k in row and row[k]:
+                            return row[k]
+            except Exception:
+                continue
+    return None
+
+# ---------- Option-chain fetch using instrument_key ----------
+def fetch_option_chain_by_instrument_key(instrument_key, expiry_date):
+    if not instrument_key:
+        logging.warning("No instrument_key provided.")
+        return None
+    params = f"instrument_key={quote_plus(str(instrument_key))}"
+    if expiry_date:
+        params += "&expiry_date=" + quote_plus(expiry_date)
+    url = UPSTOX_OPTION_CHAIN_URL + "?" + params
+    logging.info("Fetching option chain URL: %s", url)
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=25)
+        r.raise_for_status()
+        return r.json()
+    except requests.exceptions.HTTPError as he:
+        body = he.response.text if he.response is not None else ""
+        logging.warning("Option chain fetch HTTPError %s for instrument_key %s %s: %s", he.response.status_code if he.response is not None else "?", instrument_key, expiry_date, body[:1000])
+        return None
+    except Exception as e:
+        logging.warning("Option chain fetch failed for %s: %s", instrument_key, e)
         return None
 
+# ---------- Reuse earlier helper functions: extract strikes, find atm, build summary ----------
 def extract_strikes_from_chain(chain_json):
     if not chain_json:
         return []
@@ -129,10 +240,8 @@ def extract_strikes_from_chain(chain_json):
                     break
     elif isinstance(chain_json, list):
         data = chain_json
-
     if not isinstance(data, list):
         return []
-
     strikes = []
     for item in data:
         try:
@@ -223,12 +332,21 @@ def build_summary_text(symbol_label, strikes, atm_strike, window=5):
         lines.append(f"<code>{str(int(float(strike))).rjust(6)}{atm_mark}   {ce_info.ljust(20)} | {pe_info}</code>")
     return "\n".join(lines)
 
+# ---------- Polling logic ----------
 def poll_once_and_send():
-    chain_nifty = fetch_option_chain(OPTION_SYMBOL_NIFTY, OPTION_EXPIRY_NIFTY)
+    # load instruments (cached)
+    instruments = fetch_and_cache_instruments()
+    # resolve instrument keys
+    nifty_key = find_instrument_key(instruments, "nifty 50") or find_instrument_key(instruments, "nifty")
+    tcs_key = find_instrument_key(instruments, "tcs") or find_instrument_key(instruments, "tata consultancy services")
+    logging.info("Resolved instrument keys: Nifty=%s, TCS=%s", nifty_key, tcs_key)
+
+    # fetch option chains by instrument key
+    chain_nifty = fetch_option_chain_by_instrument_key(nifty_key, OPTION_EXPIRY_NIFTY)
     strikes_nifty = extract_strikes_from_chain(chain_nifty)
     atm_nifty = find_atm_strike(strikes_nifty) if strikes_nifty else None
 
-    chain_tcs = fetch_option_chain(OPTION_SYMBOL_TCS, OPTION_EXPIRY_TCS)
+    chain_tcs = fetch_option_chain_by_instrument_key(tcs_key, OPTION_EXPIRY_TCS)
     strikes_tcs = extract_strikes_from_chain(chain_tcs)
     atm_tcs = find_atm_strike(strikes_tcs) if strikes_tcs else None
 
@@ -249,8 +367,9 @@ def poll_once_and_send():
 def main():
     logging.info("Starting Option Chain poller. Interval: %ss. Nifty symbol=%s expiry=%s | TCS symbol=%s expiry=%s",
                  POLL_INTERVAL, OPTION_SYMBOL_NIFTY, OPTION_EXPIRY_NIFTY, OPTION_SYMBOL_TCS, OPTION_EXPIRY_TCS)
-    status, body_snip = health_check_token()
-    logging.info("Initial health-check returned status %s, body_snip: %s", status, body_snip[:500] if body_snip else "")
+    # quick health check: try to download instruments once at start
+    instruments = fetch_and_cache_instruments(force_refresh=False)
+    logging.info("Initial instruments loaded: %d items", len(instruments) if instruments else 0)
     while True:
         try:
             poll_once_and_send()
