@@ -1,26 +1,18 @@
 #!/usr/bin/env python3
 """
-Option Chain poller (single file):
-- Downloads Upstox instrument master (JSON preferred) from assets.upstox.com, caches it.
-- Resolves instrument_key for Nifty / TCS, then fetches option chain using instrument_key + expiry.
-- Sends compact summary to Telegram.
-- Robust fallbacks & verbose logging for UDAPI100060 debugging.
+Option Chain poller (instrument-master → option-contracts → market-quote → Telegram)
+- Uses instruments JSON from assets.upstox.com (cached)
+- Resolves option contract instrument_keys for given underlying+expiry
+- Fetches market quotes in batches and builds CE/PE summary
 """
-import os
-import time
-import logging
-import requests
-import gzip
-import json
-import csv
-import io
-import html
+import os, time, logging, requests, json, gzip, io, math, html
 from urllib.parse import quote_plus
+import datetime
 
 # ---------- CONFIG / ENV ----------
-UPSTOX_ACCESS_TOKEN = os.getenv('UPSTOX_ACCESS_TOKEN') or ""
-TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN') or ""
-TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID') or ""
+UPSTOX_ACCESS_TOKEN = os.getenv('UPSTOX_ACCESS_TOKEN','').strip()
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN','').strip()
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID','').strip()
 
 OPTION_SYMBOL_NIFTY = os.getenv('OPTION_SYMBOL_NIFTY') or "NSE_INDEX|Nifty 50"
 OPTION_EXPIRY_NIFTY = os.getenv('OPTION_EXPIRY_NIFTY') or "2025-10-07"
@@ -30,32 +22,26 @@ OPTION_EXPIRY_TCS = os.getenv('OPTION_EXPIRY_TCS') or "2025-10-28"
 
 POLL_INTERVAL = int(os.getenv('POLL_INTERVAL') or 60)
 STRIKE_WINDOW = int(os.getenv('STRIKE_WINDOW') or 5)
-
-# Instruments download/caching
-INSTRUMENTS_CACHE_DIR = os.getenv('INSTRUMENTS_CACHE_DIR') or "./cache"
 INSTRUMENTS_TTL_SECONDS = int(os.getenv('INSTRUMENTS_TTL_SECONDS') or 24*3600)
 
-# Candidate instruments URLs (you can override via env)
-CANDIDATE_INSTRUMENT_URLS = [
-    os.getenv('UPSTOX_INSTRUMENTS_JSON_URL') or "https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz",
-    os.getenv('UPSTOX_INSTRUMENTS_JSON_URL2') or "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz",
-    os.getenv('UPSTOX_INSTRUMENTS_CSV_URL') or "https://assets.upstox.com/instruments/NSE_EQ.csv",
-]
+UPSTOX_INSTRUMENTS_JSON_URL = os.getenv('UPSTOX_INSTRUMENTS_JSON_URL') or "https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz"
+UPSTOX_MARKET_QUOTE_URL = os.getenv('UPSTOX_MARKET_QUOTE_URL') or "https://api.upstox.com/v2/market-quote/quotes"
+# Option greeks endpoint (optional, docs mention v3)
+UPSTOX_OPTION_GREEK_URL = os.getenv('UPSTOX_OPTION_GREEK_URL') or "https://api.upstox.com/v3/market-quote/option-greeks"
 
-# Option chain URL (default)
-UPSTOX_OPTION_CHAIN_URL = os.getenv('UPSTOX_OPTION_CHAIN_URL') or "https://api.upstox.com/v3/option/chain"
-
-# ---------- Logging ----------
+# -------- logging & headers ----------
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
-
 if not UPSTOX_ACCESS_TOKEN or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
     logging.error("Set UPSTOX_ACCESS_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID in env.")
     raise SystemExit(1)
+HEADERS = {"Accept":"application/json", "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}"}
 
-HEADERS = {"Accept": "application/json", "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}"}
+# ---------- cache paths ----------
+CACHE_DIR = "./cache"
+os.makedirs(CACHE_DIR, exist_ok=True)
+INSTR_CACHE_PATH = os.path.join(CACHE_DIR, "instruments_complete.json")
 
-os.makedirs(INSTRUMENTS_CACHE_DIR, exist_ok=True)
-
+# ---------- helpers ----------
 def send_telegram(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
@@ -67,309 +53,331 @@ def send_telegram(text):
         logging.warning("Telegram send failed: %s", e)
         return False
 
-# ---------- Instruments fetch / cache / lookup ----------
-def _cache_path():
-    return os.path.join(INSTRUMENTS_CACHE_DIR, "instruments_complete.json")
-
 def _is_cache_fresh(path):
-    if not os.path.exists(path):
-        return False
-    age = time.time() - os.path.getmtime(path)
-    return age < INSTRUMENTS_TTL_SECONDS
+    return os.path.exists(path) and (time.time() - os.path.getmtime(path) < INSTRUMENTS_TTL_SECONDS)
 
-def _write_cache_json(path, obj):
+def _write_cache(path, obj):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f)
 
-def _read_cache_json(path):
+def _read_cache(path):
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
-def _try_download_gz_json(url):
+def _download_instruments(url):
     logging.info("Trying instruments URL: %s", url)
     try:
         r = requests.get(url, timeout=30)
         r.raise_for_status()
-        content = r.content
-        # If gzipped JSON, gunzip
+        data = r.content
+        # try gz
         try:
-            decompressed = gzip.decompress(content).decode('utf-8')
-            # parse JSON
-            js = json.loads(decompressed)
-            logging.info("Downloaded and parsed gz JSON from %s (items=%d)", url, len(js) if isinstance(js, list) else 1)
+            dec = gzip.decompress(data).decode('utf-8')
+            js = json.loads(dec)
             return js
-        except (OSError, gzip.BadGzipFile):
-            # maybe JSON plain
+        except Exception:
+            # try direct JSON
             try:
-                text = content.decode('utf-8')
-                js = json.loads(text)
+                js = json.loads(data.decode('utf-8'))
                 return js
             except Exception:
-                pass
-        # If raw CSV
-        try:
-            text = content.decode('utf-8')
-            if "\n" in text and "," in text.splitlines()[0]:
-                rows = list(csv.DictReader(io.StringIO(text)))
-                logging.info("Downloaded CSV instruments with %d rows from %s", len(rows), url)
-                return rows
-        except Exception:
-            pass
+                # try CSV fallback - not implemented; return None
+                return None
     except Exception as e:
-        logging.warning("Failed to download instruments from %s: %s", url, e)
-    return None
+        logging.warning("Download failed: %s", e)
+        return None
 
 def fetch_and_cache_instruments(force_refresh=False):
-    cache_path = _cache_path()
-    if not force_refresh and _is_cache_fresh(cache_path):
+    if not force_refresh and _is_cache_fresh(INSTR_CACHE_PATH):
         try:
-            cached = _read_cache_json(cache_path)
-            logging.info("Using cached instruments (%d items)", len(cached) if isinstance(cached, list) else 1)
+            cached = _read_cache(INSTR_CACHE_PATH)
+            logging.info("Using cached instruments (%d items)", len(cached) if isinstance(cached, list) else 0)
             return cached
         except Exception:
-            logging.warning("Failed to read cached instruments, will re-download.")
-    # try candidate urls
-    last_err = None
-    for url in CANDIDATE_INSTRUMENT_URLS:
-        if not url:
-            continue
-        js = _try_download_gz_json(url)
-        if js:
-            # normalize: if dict with keys, convert to list
-            if isinstance(js, dict):
-                # some JSON files might be object with multiple arrays; try to find list
-                for v in js.values():
-                    if isinstance(v, list):
-                        js = v
-                        break
-            # write cache
-            try:
-                _write_cache_json(cache_path, js)
-                logging.info("Cached instruments to %s", cache_path)
-            except Exception as e:
-                logging.warning("Failed to write cache: %s", e)
-            return js
-    # fallback: try reading existing cache even if stale
-    if os.path.exists(cache_path):
+            logging.warning("Failed reading cache, will redownload.")
+    js = _download_instruments(UPSTOX_INSTRUMENTS_JSON_URL)
+    if js:
+        # normalize if dict containing lists
+        if isinstance(js, dict):
+            # try to find the big list
+            for v in js.values():
+                if isinstance(v, list):
+                    js = v
+                    break
         try:
-            cached = _read_cache_json(cache_path)
-            logging.warning("Using stale cached instruments (%d items)", len(cached) if isinstance(cached, list) else 1)
+            _write_cache(INSTR_CACHE_PATH, js)
+            logging.info("Cached instruments to %s", INSTR_CACHE_PATH)
+        except Exception as e:
+            logging.warning("Failed writing cache: %s", e)
+        return js
+    # fallback: stale cache if present
+    if os.path.exists(INSTR_CACHE_PATH):
+        try:
+            cached = _read_cache(INSTR_CACHE_PATH)
+            logging.warning("Using stale cached instruments (%d items)", len(cached) if isinstance(cached, list) else 0)
             return cached
         except Exception as e:
-            last_err = e
-    logging.error("Unable to fetch instruments and no cache available. Last err: %s", last_err)
+            logging.error("No usable instruments cache: %s", e)
+            return []
+    logging.error("Unable to download instruments and no cache found.")
     return []
 
-def find_instrument_key(instruments, match_term):
-    """Match by symbol or name. Returns first found instrument_key / instrument_token / token."""
-    if not instruments:
-        return None
-    term = str(match_term).strip().lower()
-    candidate_keys = ("instrument_key","instrumentToken","instrument_token","token","id","instrument_id","instrumentId")
-    symbol_fields = ("tradingsymbol","trading_symbol","symbol","trade_symbol","display_symbol")
-    name_fields = ("name","instrumentName","display_name")
-    for row in instruments:
-        # row may be dict with varied keys
-        row_lower = {}
-        for k,v in row.items():
-            try:
-                row_lower[k] = str(v).lower()
-            except Exception:
-                row_lower[k] = ""
-        # check symbol fields
-        for sf in symbol_fields:
-            if sf in row_lower and term in row_lower[sf]:
-                # get key
-                for k in candidate_keys:
-                    if k in row and row[k]:
-                        return row[k]
-        # check name fields
-        for nf in name_fields:
-            if nf in row_lower and term in row_lower[nf]:
-                for k in candidate_keys:
-                    if k in row and row[k]:
-                        return row[k]
-    # fallback: partial match in any field
-    for row in instruments:
-        for v in row.values():
-            try:
-                if term in str(v).lower():
-                    for k in candidate_keys:
-                        if k in row and row[k]:
-                            return row[k]
-            except Exception:
-                continue
-    return None
-
-# ---------- Option-chain fetch using instrument_key ----------
-def fetch_option_chain_by_instrument_key(instrument_key, expiry_date):
-    if not instrument_key:
-        logging.warning("No instrument_key provided.")
-        return None
-    params = f"instrument_key={quote_plus(str(instrument_key))}"
-    if expiry_date:
-        params += "&expiry_date=" + quote_plus(expiry_date)
-    url = UPSTOX_OPTION_CHAIN_URL + "?" + params
-    logging.info("Fetching option chain URL: %s", url)
+def ms_to_ymd(ms):
     try:
-        r = requests.get(url, headers=HEADERS, timeout=25)
-        r.raise_for_status()
-        return r.json()
-    except requests.exceptions.HTTPError as he:
-        body = he.response.text if he.response is not None else ""
-        logging.warning("Option chain fetch HTTPError %s for instrument_key %s %s: %s", he.response.status_code if he.response is not None else "?", instrument_key, expiry_date, body[:1000])
-        return None
-    except Exception as e:
-        logging.warning("Option chain fetch failed for %s: %s", instrument_key, e)
-        return None
-
-# ---------- Reuse earlier helper functions: extract strikes, find atm, build summary ----------
-def extract_strikes_from_chain(chain_json):
-    if not chain_json:
-        return []
-    data = None
-    if isinstance(chain_json, dict):
-        if 'data' in chain_json:
-            data = chain_json['data']
-        elif 'results' in chain_json:
-            data = chain_json['results']
-        else:
-            for v in chain_json.values():
-                if isinstance(v, list):
-                    data = v
-                    break
-    elif isinstance(chain_json, list):
-        data = chain_json
-    if not isinstance(data, list):
-        return []
-    strikes = []
-    for item in data:
-        try:
-            strike_price = item.get('strike_price') or item.get('strike') or item.get('strikePrice')
-            ce = item.get('ce') or item.get('CE') or item.get('call') or None
-            pe = item.get('pe') or item.get('PE') or item.get('put') or None
-            strikes.append({'strike': strike_price, 'ce': ce, 'pe': pe})
-        except Exception:
-            continue
-    strikes_sorted = sorted([s for s in strikes if s.get('strike') is not None], key=lambda x: float(x['strike']))
-    return strikes_sorted
-
-def find_atm_strike(strikes):
-    if not strikes:
-        return None
-    try:
-        for s in strikes:
-            ce = s.get('ce')
-            pe = s.get('pe')
-            cand = None
-            if ce and isinstance(ce, dict):
-                cand = ce.get('underlying') or ce.get('underlying_price') or ce.get('underlyingPrice')
-            if cand is None and pe and isinstance(pe, dict):
-                cand = pe.get('underlying') or pe.get('underlying_price') or pe.get('underlyingPrice')
-            if cand:
-                try:
-                    up = float(cand)
-                    nearest = min(strikes, key=lambda x: abs(float(x['strike']) - up))
-                    return nearest['strike']
-                except Exception:
-                    pass
-        mid = strikes[len(strikes)//2]['strike']
-        return mid
+        return datetime.datetime.utcfromtimestamp(ms/1000.0).strftime("%Y-%m-%d")
     except Exception:
-        return strikes[0]['strike']
+        return None
 
-def build_summary_text(symbol_label, strikes, atm_strike, window=5):
+def resolve_option_instruments_for(instruments, underlying_term, expiry_yyyy_mm_dd):
+    """
+    Return list of instrument dicts (option contracts) for underlying + expiry.
+    We look for segment 'NSE_FO' rows whose expiry matches and name/tradingsymbol contains underlying_term.
+    """
+    term = underlying_term.strip().lower()
+    out = []
+    for row in instruments:
+        if not isinstance(row, dict):
+            continue
+        seg = row.get("segment") or row.get("exchangeSegment") or ""
+        if seg != "NSE_FO":
+            continue
+        exp = row.get("expiry") or row.get("expiry_date") or row.get("expiryTimestamp")
+        # expiry in ms sometimes
+        if exp:
+            exp_ymd = None
+            if isinstance(exp, (int,float)):
+                exp_ymd = ms_to_ymd(exp)
+            else:
+                # if string like '2025-10-07'
+                try:
+                    exp_ymd = str(exp).split("T")[0]
+                except:
+                    exp_ymd = None
+            if exp_ymd != expiry_yyyy_mm_dd:
+                continue
+        else:
+            continue
+        name = str(row.get("name","")).lower()
+        ts = str(row.get("tradingsymbol") or row.get("trading_symbol") or row.get("symbol") or "").lower()
+        # match underlying term in name or trading symbol
+        if term in name or term in ts:
+            # ensure it's an option (CE or PE)
+            if "ce" in ts.split() or "pe" in ts.split() or ts.strip().endswith("ce") or ts.strip().endswith("pe"):
+                out.append(row)
+    # sort by strike price if present
+    def _strike_key(r):
+        try:
+            return float(r.get("strike_price") or r.get("strike") or 0)
+        except:
+            return 0
+    return sorted(out, key=_strike_key)
+
+def chunk_list(lst, n):
+    for i in range(0, len(lst), n):
+        yield lst[i:i+n]
+
+# ---------- Market-quote fetch ----------
+def fetch_quotes_for_instrument_keys(instrument_keys):
+    """
+    Calls UPSTOX_MARKET_QUOTE_URL with instrument_key param.
+    Supports batching (Upstox docs mention limits; use batch_size=200 as safe).
+    Returns dict: instrument_key -> quote_json
+    """
+    out = {}
+    if not instrument_keys:
+        return out
+    batch_size = 200
+    for batch in chunk_list(instrument_keys, batch_size):
+        params = "&".join(f"instrument_key={quote_plus(str(k))}" for k in batch)
+        url = UPSTOX_MARKET_QUOTE_URL + "?" + params
+        logging.info("Market-quote fetch URL: %s", url[:400])
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=25)
+            r.raise_for_status()
+            j = r.json()
+            # response shape: likely { "data": [ ... ] } or list; handle both
+            data = j.get("data") if isinstance(j, dict) and "data" in j else j
+            if isinstance(data, list):
+                for item in data:
+                    key = item.get("instrument_key") or item.get("instrumentKey") or item.get("instrument_token") or None
+                    if key:
+                        out[key] = item
+            elif isinstance(data, dict):
+                # single item
+                key = data.get("instrument_key") or data.get("instrumentKey")
+                if key:
+                    out[key] = data
+        except Exception as e:
+            logging.warning("Market-quote batch fetch failed: %s", e)
+    return out
+
+# ---------- Build option chain summary using instrument rows + quotes ----------
+def build_option_chain_from_instruments(instrument_rows, quotes_map, window=5):
+    """
+    instrument_rows: list of option contract rows for an underlying+expiry (sorted by strike)
+    quotes_map: instrument_key -> quote json
+    Returns strikes list of dicts: { strike, ce: {ltp, oi, iv, key}, pe: {...} }
+    """
+    strikes = {}
+    for row in instrument_rows:
+        ik = row.get("instrument_key") or row.get("instrumentKey") or row.get("instrumentToken") or row.get("instrument_token")
+        ts = row.get("tradingsymbol") or row.get("trading_symbol") or row.get("symbol") or ""
+        strike = row.get("strike_price") or row.get("strike") or row.get("strikePrice")
+        if strike is None:
+            # try parsing from trading symbol (last token)
+            try:
+                parts = str(ts).split()
+                for p in parts:
+                    if p.isdigit():
+                        strike = float(p)
+                        break
+            except:
+                strike = None
+        if strike is None:
+            continue
+        strike = float(strike)
+        q = quotes_map.get(ik) or {}
+        # extract LTP, OI, IV robustly
+        ltp = q.get("last_traded_price") or q.get("ltp") or q.get("lastPrice") or None
+        oi = q.get("open_interest") or q.get("oi") or q.get("openInterest") or None
+        iv = q.get("iv") or q.get("implied_volatility") or q.get("IV") or None
+        # decide CE vs PE from trading symbol
+        tsl = str(ts).lower()
+        side = "ce" if " ce" in tsl or tsl.endswith("ce") or "call" in tsl else ("pe" if " pe" in tsl or tsl.endswith("pe") or "put" in tsl else None)
+        rec = strikes.setdefault(strike, {"strike": strike, "ce": None, "pe": None})
+        info = {"instrument_key": ik, "trading_symbol": ts, "ltp": ltp, "oi": oi, "iv": iv}
+        if side == "ce":
+            rec["ce"] = info
+        elif side == "pe":
+            rec["pe"] = info
+    # convert to sorted list
+    strikes_list = [strikes[k] for k in sorted(strikes.keys())]
+    return strikes_list
+
+def short_text_for_side(side):
+    if not side:
+        return "NA"
+    ltp = side.get("ltp")
+    oi = side.get("oi")
+    iv = side.get("iv")
+    try:
+        l = f"{float(ltp):,.2f}" if ltp is not None else "NA"
+    except:
+        l = str(ltp) if ltp is not None else "NA"
+    try:
+        o = f"{int(float(oi)):,}" if oi not in (None,"") else "NA"
+    except:
+        o = str(oi) if oi not in (None,"") else "NA"
+    try:
+        v = f"{float(iv):.2f}" if iv not in (None,"") else "NA"
+    except:
+        v = str(iv) if iv not in (None,"") else "NA"
+    return f"{l} / {o} / {v}"
+
+def build_summary_text_from_strikes(label, strikes_list, atm_strike=None, window=5):
     lines = []
     ts = time.strftime('%Y-%m-%d %H:%M:%S')
-    lines.append(f"📊 <b>Option Chain — {html.escape(symbol_label)}</b> — {ts}")
-    if not strikes:
+    lines.append(f"📊 <b>Option Chain — {html.escape(label)}</b> — {ts}")
+    if not strikes_list:
         lines.append("No option chain data available.")
         return "\n".join(lines)
     try:
         atm = float(atm_strike) if atm_strike is not None else None
-    except Exception:
+    except:
         atm = None
-    idx = None
-    for i,s in enumerate(strikes):
-        try:
-            if atm is not None and float(s['strike']) == atm:
-                idx = i
-                break
-        except Exception:
-            continue
-    if idx is None:
-        idx = min(range(len(strikes)), key=lambda i: abs(float(strikes[i]['strike']) - (atm or float(strikes[len(strikes)//2]['strike']))))
+    # find index nearest atm
+    idx = 0
+    if atm is not None:
+        idx = min(range(len(strikes_list)), key=lambda i: abs(float(strikes_list[i]["strike"]) - atm))
+    else:
+        idx = len(strikes_list)//2
     start = max(0, idx - window)
-    end = min(len(strikes)-1, idx + window)
+    end = min(len(strikes_list)-1, idx + window)
     lines.append("<code>Strike    CE(LTP / OI / IV)       |      PE(LTP / OI / IV)</code>")
     for i in range(start, end+1):
-        s = strikes[i]
-        strike = s.get('strike')
-        ce = s.get('ce') or {}
-        pe = s.get('pe') or {}
-        def short_info(side):
-            if not side:
-                return "NA"
-            ltp = side.get('ltp') or side.get('last_traded_price') or side.get('lastPrice') or side.get('lastTradedPrice')
-            oi = side.get('open_interest') or side.get('oi') or side.get('openInterest')
-            iv = side.get('iv') or side.get('implied_volatility') or side.get('IV')
-            try:
-                l = f"{float(ltp):,.2f}" if ltp is not None else "NA"
-            except Exception:
-                l = str(ltp) if ltp is not None else "NA"
-            try:
-                o = f"{int(oi):,}" if oi not in (None, "") and str(oi).isdigit() else (str(oi) if oi not in (None,"") else "NA")
-            except Exception:
-                o = str(oi) if oi not in (None,"") else "NA"
-            try:
-                v = f"{float(iv):.2f}" if iv not in (None,"") else "NA"
-            except Exception:
-                v = str(iv) if iv not in (None,"") else "NA"
-            return f"{l} / {o} / {v}"
-        ce_info = short_info(ce)
-        pe_info = short_info(pe)
+        s = strikes_list[i]
+        strike = s.get("strike")
+        ce = short_text_for_side(s.get("ce"))
+        pe = short_text_for_side(s.get("pe"))
         atm_mark = " ⭑" if (atm is not None and float(strike) == atm) else ""
-        lines.append(f"<code>{str(int(float(strike))).rjust(6)}{atm_mark}   {ce_info.ljust(20)} | {pe_info}</code>")
+        lines.append(f"<code>{str(int(float(strike))).rjust(6)}{atm_mark}   {ce.ljust(20)} | {pe}</code>")
     return "\n".join(lines)
 
-# ---------- Polling logic ----------
+# ---------- Orchestration ----------
 def poll_once_and_send():
-    # load instruments (cached)
-    instruments = fetch_and_cache_instruments()
-    # resolve instrument keys
-    nifty_key = find_instrument_key(instruments, "nifty 50") or find_instrument_key(instruments, "nifty")
-    tcs_key = find_instrument_key(instruments, "tcs") or find_instrument_key(instruments, "tata consultancy services")
-    logging.info("Resolved instrument keys: Nifty=%s, TCS=%s", nifty_key, tcs_key)
+    instruments = fetch_and_cache_instruments(force_refresh=False)
+    if not instruments:
+        logging.warning("No instruments available — skipping this cycle.")
+        return
+    # resolve option contract rows for each underlying+expiry
+    nifty_option_rows = resolve_option_instruments_for(instruments, "nifty", OPTION_EXPIRY_NIFTY)
+    tcs_option_rows   = resolve_option_instruments_for(instruments, "tcs", OPTION_EXPIRY_TCS)
+    logging.info("Found option row counts: Nifty=%d, TCS=%d", len(nifty_option_rows), len(tcs_option_rows))
 
-    # fetch option chains by instrument key
-    chain_nifty = fetch_option_chain_by_instrument_key(nifty_key, OPTION_EXPIRY_NIFTY)
-    strikes_nifty = extract_strikes_from_chain(chain_nifty)
-    atm_nifty = find_atm_strike(strikes_nifty) if strikes_nifty else None
+    # collect instrument_keys to fetch quotes
+    nifty_keys = [r.get("instrument_key") or r.get("instrumentToken") or r.get("instrument_token") for r in nifty_option_rows]
+    tcs_keys   = [r.get("instrument_key") or r.get("instrumentToken") or r.get("instrument_token") for r in tcs_option_rows]
+    all_keys = [k for k in (nifty_keys + tcs_keys) if k]
 
-    chain_tcs = fetch_option_chain_by_instrument_key(tcs_key, OPTION_EXPIRY_TCS)
-    strikes_tcs = extract_strikes_from_chain(chain_tcs)
-    atm_tcs = find_atm_strike(strikes_tcs) if strikes_tcs else None
+    quotes_map = fetch_quotes_for_instrument_keys(all_keys)
 
-    if strikes_nifty:
-        text = build_summary_text("Nifty 50", strikes_nifty, atm_nifty, window=STRIKE_WINDOW)
-        ok = send_telegram(text)
-        logging.info("Sent Nifty option chain summary (ATM %s). Telegram ok=%s", atm_nifty, ok)
+    # build strikes lists
+    nifty_strikes = build_option_chain_from_instruments(nifty_option_rows, quotes_map, window=STRIKE_WINDOW)
+    tcs_strikes   = build_option_chain_from_instruments(tcs_option_rows, quotes_map, window=STRIKE_WINDOW)
+
+    # Try to guess ATM: use underlying's nearest strike from underlying LTP if available
+    # attempt to find underlying instrument_key from instruments (NSE_INDEX|Nifty 50 or NSE_EQ|INE... )
+    def find_underlying_ltp(instruments, underlying_search):
+        for r in instruments:
+            ks = (r.get("instrument_key") or r.get("instrumentKey") or "")
+            ts = str(r.get("tradingsymbol") or r.get("trading_symbol") or r.get("symbol") or "").lower()
+            name = str(r.get("name") or "").lower()
+            if underlying_search in ks.lower() or underlying_search in ts or underlying_search in name:
+                q = fetch_quotes_for_instrument_keys([ks])
+                qq = q.get(ks) if isinstance(q, dict) else None
+                if qq:
+                    return qq.get("last_traded_price") or qq.get("ltp")
+        return None
+
+    nifty_under_ltp = find_underlying_ltp(instruments, "nifty")
+    tcs_under_ltp   = find_underlying_ltp(instruments, "tcs")
+
+    nifty_atm = None
+    tcs_atm = None
+    if nifty_under_ltp:
+        try: nifty_atm = float(nifty_under_ltp)
+        except: pass
+    if tcs_under_ltp:
+        try: tcs_atm = float(tcs_under_ltp)
+        except: pass
+
+    # for summary we pass atm as numeric nearest strike (optional)
+    if nifty_strikes:
+        # find nearest strike present to nifty_atm
+        atm_strike_n = None
+        if nifty_atm:
+            atm_strike_n = min([s["strike"] for s in nifty_strikes], key=lambda x: abs(x - nifty_atm))
+        summary = build_summary_text_from_strikes("Nifty 50", nifty_strikes, atm_strike_n, window=STRIKE_WINDOW)
+        send_telegram(summary)
+        logging.info("Sent Nifty summary (ATM approx %s)", atm_strike_n)
     else:
-        logging.info("No Nifty option chain to send.")
+        logging.info("No Nifty strikes to send.")
 
-    if strikes_tcs:
-        text = build_summary_text("TCS", strikes_tcs, atm_tcs, window=STRIKE_WINDOW)
-        ok = send_telegram(text)
-        logging.info("Sent TCS option chain summary (ATM %s). Telegram ok=%s", atm_tcs, ok)
+    if tcs_strikes:
+        atm_strike_t = None
+        if tcs_atm:
+            atm_strike_t = min([s["strike"] for s in tcs_strikes], key=lambda x: abs(x - tcs_atm))
+        summary = build_summary_text_from_strikes("TCS", tcs_strikes, atm_strike_t, window=STRIKE_WINDOW)
+        send_telegram(summary)
+        logging.info("Sent TCS summary (ATM approx %s)", atm_strike_t)
     else:
-        logging.info("No TCS option chain to send.")
+        logging.info("No TCS strikes to send.")
 
 def main():
-    logging.info("Starting Option Chain poller. Interval: %ss. Nifty symbol=%s expiry=%s | TCS symbol=%s expiry=%s",
-                 POLL_INTERVAL, OPTION_SYMBOL_NIFTY, OPTION_EXPIRY_NIFTY, OPTION_SYMBOL_TCS, OPTION_EXPIRY_TCS)
-    # quick health check: try to download instruments once at start
+    logging.info("Starting Option Chain poller. Interval: %ss. Nifty expiry=%s | TCS expiry=%s", POLL_INTERVAL, OPTION_EXPIRY_NIFTY, OPTION_EXPIRY_TCS)
+    # initial load
     instruments = fetch_and_cache_instruments(force_refresh=False)
-    logging.info("Initial instruments loaded: %d items", len(instruments) if instruments else 0)
+    logging.info("Initial instruments loaded: %d", len(instruments) if instruments else 0)
     while True:
         try:
             poll_once_and_send()
