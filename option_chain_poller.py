@@ -1,16 +1,11 @@
 #!/usr/bin/env python3
 """
-Option Chain poller — updated with robust batching and 429 handling.
-- instruments master download & cache
-- resolve option contracts for underlying + expiry
-- select ATM +/- STRIKE_WINDOW strikes (default 10)
-- batch market-quote requests with Retry-After + exponential backoff
-- build compact CE/PE summary and send to Telegram
+Option Chain poller — tuned for 429 avoidance with rotation of keys per poll.
 """
-import os, time, logging, requests, json, gzip, io, html, datetime
+import os, time, logging, requests, json, gzip, io, html, datetime, math
 from urllib.parse import quote_plus
 
-# ------------- CONFIG -------------
+# -------- CONFIG from env ----------
 UPSTOX_ACCESS_TOKEN = os.getenv('UPSTOX_ACCESS_TOKEN','').strip()
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN','').strip()
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID','').strip()
@@ -22,25 +17,31 @@ OPTION_SYMBOL_TCS = os.getenv('OPTION_SYMBOL_TCS') or "NSE_EQ|INE467B01029"
 OPTION_EXPIRY_TCS = os.getenv('OPTION_EXPIRY_TCS') or "2025-10-28"
 
 POLL_INTERVAL = int(os.getenv('POLL_INTERVAL') or 60)
-STRIKE_WINDOW = int(os.getenv('STRIKE_WINDOW') or 10)  # start with 10 as you wanted
+STRIKE_WINDOW = int(os.getenv('STRIKE_WINDOW') or 10)
 INSTRUMENTS_TTL_SECONDS = int(os.getenv('INSTRUMENTS_TTL_SECONDS') or 24*3600)
 
 UPSTOX_INSTRUMENTS_JSON_URL = os.getenv('UPSTOX_INSTRUMENTS_JSON_URL') or "https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz"
 UPSTOX_MARKET_QUOTE_URL = os.getenv('UPSTOX_MARKET_QUOTE_URL') or "https://api.upstox.com/v2/market-quote/quotes"
 
-# ------------- Logging & headers -------------
+# new tuning envs
+MAX_KEYS_PER_POLL = int(os.getenv('MAX_KEYS_PER_POLL') or 30)
+BATCH_SIZE = int(os.getenv('BATCH_SIZE') or 20)
+BASE_DELAY = float(os.getenv('BASE_DELAY') or 2.0)
+MAX_RETRIES = int(os.getenv('MAX_RETRIES') or 4)
+
+# -------- logging & headers ----------
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 if not UPSTOX_ACCESS_TOKEN or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
     logging.error("Set UPSTOX_ACCESS_TOKEN, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID in env.")
     raise SystemExit(1)
 HEADERS = {"Accept":"application/json", "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}"}
 
-# ------------- Cache paths -------------
+# -------- cache ----------
 CACHE_DIR = "./cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
 INSTR_CACHE_PATH = os.path.join(CACHE_DIR, "instruments_complete.json")
 
-# ------------- Helpers -------------
+# -------- helpers ----------
 def send_telegram(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
@@ -69,14 +70,12 @@ def _download_instruments(url):
         r = requests.get(url, timeout=30)
         r.raise_for_status()
         data = r.content
-        # try gzipped JSON
         try:
             dec = gzip.decompress(data).decode('utf-8')
             js = json.loads(dec)
             return js
         except Exception:
             pass
-        # try plain JSON
         try:
             js = json.loads(data.decode('utf-8'))
             return js
@@ -97,7 +96,6 @@ def fetch_and_cache_instruments(force_refresh=False):
             logging.warning("Failed reading cache, will redownload.")
     js = _download_instruments(UPSTOX_INSTRUMENTS_JSON_URL)
     if js:
-        # normalize if dict
         if isinstance(js, dict):
             for v in js.values():
                 if isinstance(v, list):
@@ -122,7 +120,6 @@ def fetch_and_cache_instruments(force_refresh=False):
 
 def ms_to_ymd(ms):
     try:
-        # keep simple UTC conversion (avoid deprecated warnings for now)
         return datetime.datetime.fromtimestamp(ms/1000.0, datetime.timezone.utc).strftime("%Y-%m-%d")
     except Exception:
         return None
@@ -152,7 +149,6 @@ def resolve_option_instruments_for(instruments, underlying_term, expiry_yyyy_mm_
         name = str(row.get("name","")).lower()
         ts = str(row.get("tradingsymbol") or row.get("trading_symbol") or row.get("symbol") or "").lower()
         if term in name or term in ts:
-            # ensure CE or PE
             if (" ce " in ts) or (" pe " in ts) or ts.strip().endswith("ce") or ts.strip().endswith("pe") or "call" in ts or "put" in ts:
                 out.append(row)
     def _strike_key(r):
@@ -166,22 +162,18 @@ def chunk_list(lst, n):
     for i in range(0, len(lst), n):
         yield lst[i:i+n]
 
-# ------------- Robust market-quote fetch (429-aware) -------------
+# -------- robust fetch with backoff & respect Retry-After ----------
 def fetch_quotes_for_instrument_keys(instrument_keys):
     out = {}
     if not instrument_keys:
         return out
 
-    # Tune these values as needed
-    batch_size = 100
-    max_retries = 4
-    base_delay = 1.0  # seconds
-
-    for batch in chunk_list(instrument_keys, batch_size):
+    # use configured batch size
+    for batch in chunk_list(instrument_keys, BATCH_SIZE):
         params = "&".join(f"instrument_key={quote_plus(str(k))}" for k in batch)
         url = UPSTOX_MARKET_QUOTE_URL + "?" + params
         attempt = 0
-        while attempt <= max_retries:
+        while attempt <= MAX_RETRIES:
             attempt += 1
             try:
                 logging.info("Market-quote fetch (batch size %d) attempt %d: %.200s", len(batch), attempt, url)
@@ -189,9 +181,9 @@ def fetch_quotes_for_instrument_keys(instrument_keys):
                 if r.status_code == 429:
                     ra = r.headers.get("Retry-After")
                     try:
-                        wait = float(ra) if ra is not None else (base_delay * (2 ** (attempt-1)))
+                        wait = float(ra) if ra is not None else (BASE_DELAY * (2 ** (attempt-1)))
                     except:
-                        wait = base_delay * (2 ** (attempt-1))
+                        wait = BASE_DELAY * (2 ** (attempt-1))
                     logging.warning("Received 429. Waiting %.1fs before retry (Retry-After=%s).", wait, ra)
                     time.sleep(wait)
                     continue
@@ -207,18 +199,18 @@ def fetch_quotes_for_instrument_keys(instrument_keys):
                     key = data.get("instrument_key") or data.get("instrumentKey")
                     if key:
                         out[key] = data
-                # polite pause after success
-                time.sleep(0.12)
+                # polite pause
+                time.sleep(0.15)
                 break
             except requests.exceptions.RequestException as e:
-                wait = base_delay * (2 ** (attempt-1))
+                wait = BASE_DELAY * (2 ** (attempt-1))
                 logging.warning("Market-quote batch fetch failed (attempt %d): %s. Backing off %.1fs", attempt, e, wait)
                 time.sleep(wait)
         else:
-            logging.error("Batch failed after %d attempts; skipping these keys.", max_retries)
+            logging.error("Batch failed after %d attempts; skipping these keys.", MAX_RETRIES)
     return out
 
-# ------------- Build option chain from rows + quotes -------------
+# -------- build chain ----------
 def build_option_chain_from_instruments(instrument_rows, quotes_map):
     strikes = {}
     for row in instrument_rows:
@@ -291,7 +283,7 @@ def build_summary_text_from_strikes(label, strikes_list, atm_strike=None, window
         lines.append(f"<code>{str(int(float(strike))).rjust(6)}{atm_mark}   {ce.ljust(20)} | {pe}</code>")
     return "\n".join(lines)
 
-# ------------- Orchestration (with underlying batching & refinement) -------------
+# -------- select window keys (unchanged) ----------
 def select_window_keys(option_rows, atm_val, window=STRIKE_WINDOW):
     strike_map = {}
     for r in option_rows:
@@ -326,6 +318,7 @@ def select_window_keys(option_rows, atm_val, window=STRIKE_WINDOW):
             chosen.append(rec["pe"])
     return chosen
 
+# -------- orchestration with per-poll rotation ----------
 def poll_once_and_send():
     instruments = fetch_and_cache_instruments(force_refresh=False)
     if not instruments:
@@ -336,7 +329,7 @@ def poll_once_and_send():
     tcs_rows   = resolve_option_instruments_for(instruments, "tcs", OPTION_EXPIRY_TCS)
     logging.info("Found option rows: Nifty=%d, TCS=%d", len(nifty_rows), len(tcs_rows))
 
-    # find underlying instrument_key(s) once
+    # find underlying keys
     def find_underlying_key(instruments, term):
         term = term.lower()
         for r in instruments:
@@ -350,83 +343,93 @@ def poll_once_and_send():
     nifty_under_key = find_underlying_key(instruments, "nifty")
     tcs_under_key   = find_underlying_key(instruments, "tcs")
 
-    # initial selection using median (ATM unknown) — small set
+    # initial median-based keys (small)
     nifty_keys_initial = select_window_keys(nifty_rows, None)
     tcs_keys_initial   = select_window_keys(tcs_rows, None)
 
-    # include underlying keys to fetch actual LTP for ATM estimation
-    all_keys = []
+    # compose candidate keys (include underlying)
+    candidate_keys = []
     if nifty_under_key:
-        all_keys.append(nifty_under_key)
+        candidate_keys.append(nifty_under_key)
     if tcs_under_key and tcs_under_key != nifty_under_key:
-        all_keys.append(tcs_under_key)
-    all_keys.extend(k for k in (nifty_keys_initial + tcs_keys_initial) if k)
+        candidate_keys.append(tcs_under_key)
+    candidate_keys.extend(k for k in (nifty_keys_initial + tcs_keys_initial) if k)
 
-    # dedupe preserving order
-    seen = set()
-    all_keys_unique = []
-    for k in all_keys:
+    # dedupe
+    seen = set(); cand = []
+    for k in candidate_keys:
         if k and k not in seen:
-            seen.add(k)
-            all_keys_unique.append(k)
+            seen.add(k); cand.append(k)
 
-    logging.info("Final keys to fetch (incl underlying): %d", len(all_keys_unique))
-    quotes_map = fetch_quotes_for_instrument_keys(all_keys_unique)
+    # rotate / slice so we don't fetch all keys every poll
+    total = len(cand)
+    if total == 0:
+        logging.info("No candidate keys.")
+        quotes_map = {}
+    else:
+        # slice size = MAX_KEYS_PER_POLL; use time-based offset to rotate
+        slice_size = min(MAX_KEYS_PER_POLL, total)
+        polls_since_epoch = int(time.time() // POLL_INTERVAL)
+        pages = math.ceil(total / slice_size)
+        offset = polls_since_epoch % pages
+        start = offset * slice_size
+        end = min(start + slice_size, total)
+        keys_this_poll = cand[start:end]
+        logging.info("Rotation slicing: total=%d pages=%d offset=%d -> fetching %d keys (idx %d..%d)", total, pages, offset, len(keys_this_poll), start, end-1)
+        quotes_map = fetch_quotes_for_instrument_keys(keys_this_poll)
 
-    # compute ATM from underlying quotes if available
+    # attempt to estimate ATM from underlying if present in quotes_map
     nifty_atm = None
     tcs_atm = None
     if nifty_under_key and quotes_map.get(nifty_under_key):
         try:
             nifty_atm = float(quotes_map[nifty_under_key].get("last_traded_price") or quotes_map[nifty_under_key].get("ltp"))
-        except:
-            nifty_atm = None
+        except: pass
     if tcs_under_key and quotes_map.get(tcs_under_key):
         try:
             tcs_atm = float(quotes_map[tcs_under_key].get("last_traded_price") or quotes_map[tcs_under_key].get("ltp"))
-        except:
-            tcs_atm = None
+        except: pass
 
     logging.info("Estimated ATMs: Nifty=%s, TCS=%s", nifty_atm, tcs_atm)
 
-    # re-select keys around real ATM (if available)
+    # now select final keys around ATM (refined); but only request additional if necessary and within limits
     nifty_keys = select_window_keys(nifty_rows, nifty_atm)
     tcs_keys   = select_window_keys(tcs_rows, tcs_atm)
+    # ensure we only use keys we already fetched (to avoid new big burst)
+    nifty_keys = [k for k in nifty_keys if k in quotes_map]
+    tcs_keys   = [k for k in tcs_keys if k in quotes_map]
 
-    # fetch any newly selected keys not already fetched
-    refined_new_keys = [k for k in (nifty_keys + tcs_keys) if k and k not in all_keys_unique]
-    if refined_new_keys:
-        logging.info("Fetching additional %d keys for refined ATM window.", len(refined_new_keys))
-        more_quotes = fetch_quotes_for_instrument_keys(refined_new_keys)
-        quotes_map.update(more_quotes)
+    logging.info("Using keys fetched for summary: Nifty=%d, TCS=%d", len(nifty_keys), len(tcs_keys))
 
-    # build strikes and send summary
+    # build strikes and send
     nifty_strikes = build_option_chain_from_instruments([r for r in nifty_rows if (r.get("instrument_key") in nifty_keys)], quotes_map)
     tcs_strikes   = build_option_chain_from_instruments([r for r in tcs_rows if (r.get("instrument_key") in tcs_keys)], quotes_map)
 
     if nifty_strikes:
         atm_n = None
         if nifty_atm:
-            atm_n = min([s["strike"] for s in nifty_strikes], key=lambda x: abs(x - nifty_atm))
+            try: atm_n = min([s["strike"] for s in nifty_strikes], key=lambda x: abs(x - nifty_atm))
+            except: atm_n = None
         summary = build_summary_text_from_strikes("Nifty 50", nifty_strikes, atm_n, window=STRIKE_WINDOW)
         send_telegram(summary)
         logging.info("Sent Nifty summary (ATM approx %s)", atm_n)
     else:
-        logging.info("No Nifty strikes to send.")
+        logging.info("No Nifty strikes to send (possibly due to 429s).")
 
     if tcs_strikes:
         atm_t = None
         if tcs_atm:
-            atm_t = min([s["strike"] for s in tcs_strikes], key=lambda x: abs(x - tcs_atm))
+            try: atm_t = min([s["strike"] for s in tcs_strikes], key=lambda x: abs(x - tcs_atm))
+            except: atm_t = None
         summary = build_summary_text_from_strikes("TCS", tcs_strikes, atm_t, window=STRIKE_WINDOW)
         send_telegram(summary)
         logging.info("Sent TCS summary (ATM approx %s)", atm_t)
     else:
-        logging.info("No TCS strikes to send.")
+        logging.info("No TCS strikes to send (possibly due to 429s).")
 
-# ------------- Main -------------
+# ----- main -----
 def main():
-    logging.info("Starting Option Chain poller. Poll interval: %ss. STRIKE_WINDOW=%s", POLL_INTERVAL, STRIKE_WINDOW)
+    logging.info("Starting Option Chain poller. Poll interval: %ss. STRIKE_WINDOW=%s MAX_KEYS_PER_POLL=%s BATCH_SIZE=%s", POLL_INTERVAL, STRIKE_WINDOW, MAX_KEYS_PER_POLL, BATCH_SIZE)
     instruments = fetch_and_cache_instruments(force_refresh=False)
     logging.info("Initial instruments loaded: %d", len(instruments) if instruments else 0)
     while True:
