@@ -12,12 +12,7 @@ import requests
 import html
 from urllib.parse import quote_plus
 
-# Logging
-logging.basicConfig(level=logging.INFO, format='%(Y-%m-%d %H:%M:%S')  # fallback format replaced below
-)
-# fix logging format properly
-for h in logging.root.handlers[:]:
-    logging.root.removeHandler(h)
+# Logging (clean, correct format)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 
 # Config from env
@@ -25,18 +20,17 @@ UPSTOX_ACCESS_TOKEN = os.getenv('UPSTOX_ACCESS_TOKEN')
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 
-# Symbols + expiries (must be provided)
+# Symbols + expiries (must be provided). Defaults set to your provided expiries.
 OPTION_SYMBOL_NIFTY = os.getenv('OPTION_SYMBOL_NIFTY') or "NSE_INDEX|Nifty 50"
-OPTION_EXPIRY_NIFTY = os.getenv('OPTION_EXPIRY_NIFTY') or ""  # YYYY-MM-DD or empty
+OPTION_EXPIRY_NIFTY = os.getenv('OPTION_EXPIRY_NIFTY') or "2025-10-07"  # YYYY-MM-DD
 OPTION_SYMBOL_TCS = os.getenv('OPTION_SYMBOL_TCS') or "NSE_EQ|INE467B01029"
-OPTION_EXPIRY_TCS = os.getenv('OPTION_EXPIRY_TCS') or ""     # YYYY-MM-DD or empty
+OPTION_EXPIRY_TCS = os.getenv('OPTION_EXPIRY_TCS') or "2025-10-28"    # YYYY-MM-DD
 
 POLL_INTERVAL = int(os.getenv('POLL_INTERVAL') or 60)  # seconds
 STRIKE_WINDOW = int(os.getenv('STRIKE_WINDOW') or 5)   # ATM +/- window
 TOP_N_STRIKES = int(os.getenv('TOP_N_STRIKES') or 10)  # fallback limit to show
 
 UPSTOX_OPTION_CHAIN_URL = os.getenv('UPSTOX_OPTION_CHAIN_URL') or "https://api.upstox.com/v3/option/chain"
-# Optional: an instruments/lookup endpoint if you have one for resolving instrument tokens
 UPSTOX_INSTRUMENTS_URL = os.getenv('UPSTOX_INSTRUMENTS_URL') or ""
 
 # Basic validation
@@ -45,7 +39,7 @@ if not UPSTOX_ACCESS_TOKEN or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
     raise SystemExit(1)
 
 if not OPTION_EXPIRY_NIFTY or not OPTION_EXPIRY_TCS:
-    logging.warning("OPTION_EXPIRY_NIFTY or OPTION_EXPIRY_TCS not set. You must set expiry dates (YYYY-MM-DD) for accurate results. Script will still try fallback without expiry.")
+    logging.warning("OPTION_EXPIRY_NIFTY or OPTION_EXPIRY_TCS not set. You must set expiry dates (YYYY-MM-DD).")
 
 HEADERS = {"Accept": "application/json", "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}"}
 
@@ -63,12 +57,10 @@ def send_telegram(text):
 def health_check_token():
     """Optional lightweight health-check: try a simple GET to the option endpoint (no params) or instruments URL."""
     logging.info("Performing token health check...")
-    # Prefer instruments URL if provided
     test_url = UPSTOX_INSTRUMENTS_URL or (UPSTOX_OPTION_CHAIN_URL + "?symbol=" + quote_plus(OPTION_SYMBOL_NIFTY))
     try:
         r = requests.get(test_url, headers=HEADERS, timeout=12)
         logging.info("Health check status: %s", r.status_code)
-        # don't raise; just return status and body snippet
         return r.status_code, r.text[:800]
     except Exception as e:
         logging.warning("Health check failed: %s", e)
@@ -157,7 +149,6 @@ def find_atm_strike(strikes):
     if not strikes:
         return None
     try:
-        # Try to read underlying price from CE or PE
         for s in strikes:
             ce = s.get('ce')
             pe = s.get('pe')
@@ -169,12 +160,10 @@ def find_atm_strike(strikes):
             if cand:
                 try:
                     up = float(cand)
-                    # nearest strike
                     nearest = min(strikes, key=lambda x: abs(float(x['strike']) - up))
                     return nearest['strike']
                 except Exception:
                     pass
-        # fallback: median or nearest by position
         mid = strikes[len(strikes)//2]['strike']
         return mid
     except Exception:
@@ -194,7 +183,7 @@ def build_summary_text(symbol_label, strikes, atm_strike, window=5):
     idx = None
     for i,s in enumerate(strikes):
         try:
-            if float(s['strike']) == float(atm_strike):
+            if atm is not None and float(s['strike']) == atm:
                 idx = i
                 break
         except Exception:
@@ -260,7 +249,6 @@ def poll_once_and_send():
 def main():
     logging.info("Starting Option Chain poller. Interval: %ss. Nifty symbol=%s expiry=%s | TCS symbol=%s expiry=%s",
                  POLL_INTERVAL, OPTION_SYMBOL_NIFTY, OPTION_EXPIRY_NIFTY, OPTION_SYMBOL_TCS, OPTION_EXPIRY_TCS)
-    # health-check at start
     status, body_snip = health_check_token()
     logging.info("Initial health-check returned status %s, body_snip: %s", status, body_snip[:500] if body_snip else "")
     while True:
